@@ -1,0 +1,285 @@
+<html>
+    <head>
+        <title>An OAuth 2.0 DPoP Sample Client</title>
+        <!--
+            DISCLAIMER:
+            This code is intended for research and learning purposes only. It comes with NO WARRANTY.
+            It has not been security tested, there are no guarantees it will work on your Authorization
+            Server. With the fickle nature of implementations it may require tweaking.
+            
+            That being said, enjoy playing with it. It was tested against a very popular Authorization 
+            Server and seemed to work well.
+
+            - The Identity Citizen -
+            https://x.com/@identitycitizen
+            https://www.linkedin.com/company/the-identity-citizen
+
+        -->
+        <script>
+            const client_id="DPOP";
+            const redirect_uri="http://localhost";
+            const url = "https://auth.identitycitizen.local:9031/as/authorization.oauth2";
+            const token_url = "https://auth.identitycitizen.local:9031/as/token.oauth2";
+            const user_info_url = "https://auth.identitycitizen.local:9031/idp/userinfo.openid";
+
+ 
+            let params = new URLSearchParams(window.location.search);
+            let code = null;
+            let auth = false;
+ 
+            // Search for returning code param in query string for later use
+            for (const [key, value] of params.entries()) {
+                if ( key == "code" ) {
+                    code = value;
+                }
+            }
+ 
+            // We weren't able to get a code, commence oauth pkce flow
+            if ( code == null ) {
+                let verifier = generateRandomString(60);
+                let state = generateRandomString(12);
+                localStorage.setItem("verifier", verifier);
+                const encoder = new TextEncoder();
+                const encodedVerifier = encoder.encode(verifier);
+               
+                crypto.subtle.digest("SHA-256", encodedVerifier).then( (hash) => {
+                    let primedChallenge = base64URLEncode(hash);
+                    document.location = url + "?client_id=" + client_id + "&redirect_uri=" + redirect_uri +
+                                        "&scope=openid&response_type=code&state=" + state + "&code_challenge=" + primedChallenge + "&code_challenge_method=S256"
+                });
+            }
+ 
+            // Random string generator for state, verifier and jti claim value creation
+            function generateRandomString(length){
+                let chars = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+                let challenge = '';
+ 
+                const array = new Uint32Array(length);
+                window.crypto.getRandomValues(array);
+ 
+                for (let i = 0; i < length; i++) {
+                    challenge += chars[array[i] % chars.length];
+                }
+                return challenge;
+            }
+ 
+            // Base64 encoding for the challenge prep and signatures
+            function base64URLEncode(hashedVerifier) {
+                var str = "";
+                var bytes = new Uint8Array(hashedVerifier);
+                var len = bytes.byteLength;
+                for (var i = 0; i < len; i++) {
+                    str += String.fromCharCode(bytes[i]);
+                }
+                return btoa(str)
+                    .replace(/\+/g, "-")
+                    .replace(/\//g, "_")
+                    .replace(/=+$/, "");
+            }
+
+            // Used for raw JWT encoding
+            function base64url(source) {
+                return btoa(source)
+                    .replace(/\+/g, '-')
+                    .replace(/\//g, '_')
+                    .replace(/=/g, '');
+            }
+
+            // String to array buffer handler
+            function stringToArrayBuffer(str) {
+                const buf = new ArrayBuffer(str.length);
+                const bufView = new Uint8Array(buf);
+                for (let i = 0, strLen = str.length; i < strLen; i++) {
+                    bufView[i] = str.charCodeAt(i);
+                }
+                return buf;
+            }
+
+            // Print content to webpage
+            function appendContent(content) {
+                const existingContent = document.getElementById("tokenContent").textContent;
+                document.getElementById("tokenContent").textContent = existingContent + "\n" + content;
+            }
+
+
+            /*
+             *  The "DPOP" Handler. This is where all the logic lies for successfully completing a DPOP transation
+             *  using no libraries, all raw JavaScript which should be compatible in all modern browsers, however
+             *  only tested in Firefox.
+             */
+            async function handleDPoP( code,  verifier ) {
+                
+                // Define the algorithm parameters
+                const algorithm = {
+                    name: 'ECDSA',
+                    namedCurve: 'P-256', // For ES256, use the P-256 curve
+                    hash: { name: 'SHA-256' }, // SHA-256 hashing algorithm
+                };
+
+                // Generate the Public and Private Key Pairs
+                // Keep the Private Key in the client (this web app)
+                // Send the Public Key via the DPoP JWT to Authorization Server
+                const keyPair = await window.crypto.subtle.generateKey(algorithm, true, ['sign', 'verify']);
+
+                // Export the Public Key so we can add it to the DPoP JWT
+                const jwkObj = await window.crypto.subtle.exportKey('jwk', keyPair.publicKey);
+
+                // Build out our DPoP JWT Header using the exported Public Key from our generated Key Pair
+                const jwt_header = {
+                    typ: "dpop+jwt",
+                    alg: "ES256",
+                    jwk: {
+                        kty: jwkObj.kty,
+                        x: jwkObj.x,
+                        y: jwkObj.y,
+                        crv: jwkObj.crv
+                    }
+                }
+
+                appendContent("DPoP Token Request JWT Header:");
+                appendContent(JSON.stringify(jwt_header, null, 4));
+
+                // Build out our DPoP Body
+                const jwt_body = {
+                    "jti": generateRandomString(10),
+                    "htm": "POST",
+                    "htu": token_url,
+                    "iat": Math.floor(Date.now() / 1000)
+                }
+
+                appendContent("DPoP Token Request JWT Body:");
+                appendContent(JSON.stringify(jwt_body, null, 4));
+
+                // Base 64 URL encode the JWT Body and Header separately
+                const enc_jwt_header = base64url(JSON.stringify(jwt_header));
+                const enc_jwt_body = base64url(JSON.stringify(jwt_body));
+
+                // Concatenate header and payload with a period '.'
+                const unsignedToken = `${enc_jwt_header}.${enc_jwt_body}`;
+
+                // Sign our DPoP JWT Token with the Private Key
+                const signature = await window.crypto.subtle.sign(algorithm, keyPair.privateKey, stringToArrayBuffer(unsignedToken));
+
+                // Convert signature to base64url
+                const signatureString = base64URLEncode(new Uint8Array(signature));
+
+                // Concatenate the unsigned token and signature with a period '.'
+                const signedToken = `${unsignedToken}.${signatureString}`;
+
+                // Construct our HTTP Request to exchange our Authorization Code for an Access Token
+                const tokenRequestPayload = {
+                    body: "client_id=" + client_id +
+                        "&code=" + code + "&code_verifier=" + verifier + "&grant_type=authorization_code&redirect_uri=" + redirect_uri,
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "DPoP": signedToken
+                    }
+                }
+
+                const response = await fetch(token_url, tokenRequestPayload);
+                const data = await response.json();
+
+                // extract the id token and get the userid and groups from the claims
+                let access_token = data.access_token.replace(/-/g, '+').replace(/_/g, '/');
+
+                // Print out our Access Token body
+                appendContent("Access Token:");
+                appendContent(JSON.stringify(JSON.parse(atob(access_token.split("\.")[1])), null, 4));
+
+                // Remove the code from the query string so if the user refreshes the page the token exchange won't occur and fail
+                window.history.replaceState({}, document.title, window.location.href.split("?")[0]);
+                localStorage.removeItem("verifier");
+
+                // Build DPoP JWT Header for the User Info request
+                const user_header = {
+                    typ: "dpop+jwt",
+                    alg: "ES256",
+                    jwk: {
+                        kty: jwkObj.kty,
+                        x: jwkObj.x,
+                        y: jwkObj.y,
+                        crv: jwkObj.crv
+                    }
+                }
+
+                appendContent("DPoP UserInfo Request JWT Header:");
+                appendContent(JSON.stringify(user_header, null, 4));
+
+                // Prepare the Access Token for hashing to inject into the DPoP JWT body "ath" claim
+                const encoder = new TextEncoder();
+                const encodedAccessToken = encoder.encode(access_token);
+
+                // Generate the hash
+                const hash = await crypto.subtle.digest("SHA-256", encodedAccessToken);
+
+                // Build out our DPoP JWT Body
+                const user_body = {
+                    "jti": generateRandomString(10),
+                    "htm": "GET",
+                    "htu": user_info_url,
+                    "iat": Math.floor(Date.now() / 1000),
+                    "ath": base64URLEncode(hash)
+                }
+
+                appendContent("DPoP UserInfo Request JWT Body:");
+                appendContent(JSON.stringify(user_body, null, 4));
+
+                // Start preparing our JWT Token by Base64 URL encoding each individually
+                const enc_user_header = base64url(JSON.stringify(user_header));
+                const enc_user_body = base64url(JSON.stringify(user_body));
+
+                // Concatenate header and payload with a period '.'
+                const unsignedTokenUser = `${enc_user_header}.${enc_user_body}`;
+
+                const signatureUser = await window.crypto.subtle.sign(algorithm, keyPair.privateKey, stringToArrayBuffer(unsignedTokenUser));
+
+                // Convert signature to base64url
+                const signatureStringUser = base64URLEncode(new Uint8Array(signatureUser));
+
+                // Concatenate the unsigned token and signature with a period '.'
+                const signedTokenUser = `${unsignedTokenUser}.${signatureStringUser}`;
+
+                // Preparing our request to the User Info endpoint, note the DPoP scheme on the Authorization header
+                const userInfoRequest = {
+                    method: "GET",
+                    headers: {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Authorization": "DPoP " + access_token,
+                        "DPoP": signedTokenUser
+                    }
+                }
+
+                const userInfo = await fetch(user_info_url, userInfoRequest).then( (response) => response.json() );
+                appendContent("User Info Payload:");
+                appendContent(JSON.stringify(userInfo, null, 4));
+            }
+ 
+        </script>
+    </head>
+    <body>
+        <div>
+            <pre id="tokenContent">
+                <!-- Placeholder for the token result -->
+            </pre>
+        </div>
+        <script>
+            // if we find a code value in the query string, attempt to exchange it for an id token
+            if ( code !== null ) {
+
+                // Code found, let's try to exchange for token(s)
+                let verifier = localStorage.getItem("verifier");
+
+                // Check if the browser supports the Web Crypto API (Chrome/Firefox/Edge, etc should support)
+                if (window.crypto && window.crypto.subtle) {
+                    
+                    // Call the DPoP Handler (called in a function so we can use async/await for easier code readability)
+                    handleDPoP( code, verifier );
+
+                } else {
+                    console.error("Web Crypto API not supported.");
+                }
+            }
+        </script>
+    </body>
+</html>
